@@ -1,9 +1,10 @@
 /**
  * 우리말샘 MCP 서버 (Cloudflare Workers용)
- * HTTP API로 단어 검색 기능 제공
+ * MCP over HTTP 프로토콜로 단어 검색 기능 제공
  */
 
 import { MalsaemApiClient, getApiKey } from "./api/malsaem.js";
+import { handleMcpRequest } from "./handlers.js";
 import { logger } from "./utils/logger.js";
 
 /**
@@ -18,7 +19,7 @@ interface Env {
  */
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -64,6 +65,8 @@ function successResponse(data: unknown, status: number = 200): Response {
   });
 }
 
+// MCP 핸들러는 src/handlers.ts에서 공통으로 관리
+
 /**
  * Workers 진입점
  */
@@ -93,112 +96,147 @@ export default {
         );
       }
 
-      // 루트 경로: API 정보 제공
+      // 루트 경로: MCP 서버 정보 제공
       if (url.pathname === "/" || url.pathname === "") {
         const response = successResponse({
           name: "우리말샘 MCP 서버",
           version: "1.0.0",
-          endpoints: {
-            "/search": "단어 검색 (GET 또는 POST)",
-          },
+          protocol: "MCP over HTTP",
+          endpoint: "/mcp",
           copyright: "우리말샘(국립국어원), CC BY-SA 2.0 KR",
         });
         logger.logResponse(200, Date.now() - startTime);
         return response;
       }
 
-      // 검색 엔드포인트
-      if (url.pathname === "/search") {
-        let word: string | undefined;
-        let num: number = 10;
-        try {
-          if (request.method === "GET") {
-            // GET 요청: 쿼리 파라미터에서 추출
-            word = url.searchParams.get("word") || undefined;
-            const numParam = url.searchParams.get("num");
-            if (numParam) {
-              num = parseInt(numParam, 10);
-              if (isNaN(num) || num < 1 || num > 100) {
-                return errorResponse(
-                  "num 파라미터는 1-100 사이의 숫자여야 합니다."
-                );
-              }
-            }
-          } else if (request.method === "POST") {
-            // POST 요청: JSON body에서 추출
-            const body = (await request.json()) as {
-              word?: string;
-              num?: number;
-            };
-            word = body.word;
-            if (body.num !== undefined) {
-              num = body.num;
-              if (num < 1 || num > 100) {
-                return errorResponse(
-                  "num 파라미터는 1-100 사이의 숫자여야 합니다."
-                );
-              }
-            }
-          } else {
-            return errorResponse(
-              "지원하지 않는 HTTP 메서드입니다. GET 또는 POST를 사용해주세요.",
-              405
-            );
-          }
-
-          if (!word || word.trim().length === 0) {
-            logger.warn("Missing word parameter");
-            return errorResponse("word 파라미터가 필요합니다.");
-          }
-
-          const apiStartTime = Date.now();
-          logger.logApiCall(word.trim(), num);
-          const result = await apiClient.searchWord(word.trim(), num);
-          const apiDuration = Date.now() - apiStartTime;
-          logger.logApiCall(word.trim(), num, apiDuration, true);
-
-          // JSON 형식으로 반환
-          const response = apiClient.formatSearchResultJson(result);
-          logger.logResponse(200, Date.now() - startTime, {
-            total: result.channel?.total || 0,
-            apiDuration: `${apiDuration}ms`,
-          });
-
-          return successResponse(response);
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : String(error);
-          const errorObj =
-            error instanceof Error ? error : new Error(String(error));
-
-          logger.error("Search error", errorObj, {
-            word,
-            num,
-            duration: Date.now() - startTime,
-          });
-
-          let status = 500;
-          if (
-            errorMessage.includes("요청 한도 초과") ||
-            errorMessage.includes("Rate Limit") ||
-            errorMessage.includes("429")
-          ) {
-            status = 429;
-            logger.warn("Rate limit exceeded", { word, num });
-          } else if (
-            errorMessage.includes("인증 오류") ||
-            errorMessage.includes("API 키") ||
-            errorMessage.includes("Unregistered key")
-          ) {
-            status = 401;
-            logger.error("Authentication error", errorObj);
-          }
-
-          logger.logResponse(status, Date.now() - startTime);
+      // MCP over HTTP 엔드포인트 (PlayMCP용)
+      if (url.pathname === "/mcp") {
+        // POST 요청만 지원
+        if (request.method !== "POST") {
           return errorResponse(
-            `검색 중 오류가 발생했습니다: ${errorMessage}`,
-            status
+            "MCP 엔드포인트는 POST 메서드만 지원합니다.",
+            405
           );
+        }
+
+        try {
+          // 요청 본문이 비어있을 수 있음 (PlayMCP 초기 연결)
+          let mcpRequest: {
+            jsonrpc?: string;
+            method?: string;
+            params?: {
+              name?: string;
+              arguments?: Record<string, unknown>;
+            };
+            id?: string | number;
+          };
+
+          try {
+            const bodyText = await request.text();
+            if (bodyText.trim()) {
+              mcpRequest = JSON.parse(bodyText);
+            } else {
+              // 빈 요청: 초기 연결 - tools/list 반환
+              mcpRequest = {
+                jsonrpc: "2.0",
+                method: "tools/list",
+                id: 1,
+              };
+            }
+          } catch (parseError) {
+            // JSON 파싱 실패 시 기본값
+            mcpRequest = {
+              jsonrpc: "2.0",
+              method: "tools/list",
+              id: 1,
+            };
+          }
+
+          logger.logRequest(
+            "MCP",
+            mcpRequest.method || "unknown",
+            mcpRequest.params
+          );
+
+          // 공통 핸들러로 MCP 요청 처리
+          let response: {
+            jsonrpc: string;
+            id?: string | number;
+            result?: unknown;
+            error?: { code: number; message: string };
+          };
+
+          try {
+            // API 호출 로깅 (tools/call인 경우)
+            if (mcpRequest.method === "tools/call") {
+              const toolName = mcpRequest.params?.name as string;
+              const args = mcpRequest.params?.arguments as
+                | Record<string, unknown>
+                | undefined;
+              if (toolName === "search_word" && args?.word) {
+                const word = args?.word as string;
+                const num = (args?.num as number) || 10;
+                logger.logApiCall(word.trim(), num);
+              }
+            }
+
+            // 공통 핸들러 호출
+            response = await handleMcpRequest(apiClient, mcpRequest);
+
+            // API 호출 완료 로깅
+            if (mcpRequest.method === "tools/call") {
+              const toolName = mcpRequest.params?.name as string;
+              const args = mcpRequest.params?.arguments as
+                | Record<string, unknown>
+                | undefined;
+              if (toolName === "search_word" && args?.word) {
+                const apiDuration = Date.now() - startTime;
+                logger.logApiCall(
+                  args.word as string,
+                  (args.num as number) || 10,
+                  apiDuration,
+                  true
+                );
+              }
+            }
+
+            logger.logResponse(200, Date.now() - startTime);
+
+            // MCP JSON-RPC 2.0 응답
+            return new Response(JSON.stringify(response), {
+              headers: {
+                ...corsHeaders,
+                "Content-Type": "application/json",
+              },
+            });
+          } catch (error) {
+            logger.error(
+              "MCP request error",
+              error instanceof Error ? error : new Error(String(error))
+            );
+            const errorResponse = {
+              jsonrpc: "2.0",
+              id: mcpRequest.id,
+              error: {
+                code: -32000,
+                message: error instanceof Error ? error.message : String(error),
+              },
+            };
+
+            // MCP JSON-RPC 2.0 에러 응답
+            return new Response(JSON.stringify(errorResponse), {
+              headers: {
+                ...corsHeaders,
+                "Content-Type": "application/json",
+              },
+            });
+          }
+        } catch (error) {
+          logger.error(
+            "MCP request parse error",
+            error instanceof Error ? error : new Error(String(error))
+          );
+          return errorResponse("Invalid MCP request format", 400);
         }
       }
 
